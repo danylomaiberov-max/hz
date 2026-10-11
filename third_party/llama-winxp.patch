@@ -1,0 +1,79 @@
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 5428d51..144ae62 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -427,20 +427,22 @@ typedef pthread_t          ggml_thread_t;
+ 
+ #if defined(_WIN32)
+ 
+-typedef CONDITION_VARIABLE ggml_cond_t;
+-typedef SRWLOCK            ggml_mutex_t;
+-
+-#define ggml_mutex_init(m)   InitializeSRWLock(m)
+-#define ggml_mutex_destroy(m)
+-#define ggml_mutex_lock(m)   AcquireSRWLockExclusive(m)
+-#define ggml_mutex_unlock(m) ReleaseSRWLockExclusive(m)
+-#define ggml_mutex_lock_shared(m)   AcquireSRWLockShared(m)
+-#define ggml_mutex_unlock_shared(m) ReleaseSRWLockShared(m)
+-
+-#define ggml_cond_init(c)    InitializeConditionVariable(c)
++// Windows XP compatible primitives: CRITICAL_SECTION + polling condition variable
++// (SRWLOCK / CONDITION_VARIABLE need Vista or later). All callers wait in predicate loops.
++typedef LONG               ggml_cond_t;
++typedef CRITICAL_SECTION   ggml_mutex_t;
++
++#define ggml_mutex_init(m)   InitializeCriticalSection(m)
++#define ggml_mutex_destroy(m) DeleteCriticalSection(m)
++#define ggml_mutex_lock(m)   EnterCriticalSection(m)
++#define ggml_mutex_unlock(m) LeaveCriticalSection(m)
++#define ggml_mutex_lock_shared(m)   EnterCriticalSection(m)
++#define ggml_mutex_unlock_shared(m) LeaveCriticalSection(m)
++
++#define ggml_cond_init(c)    (*(c) = 0)
+ #define ggml_cond_destroy(c)
+-#define ggml_cond_wait(c, m) SleepConditionVariableSRW(c, m, INFINITE, CONDITION_VARIABLE_LOCKMODE_SHARED)
+-#define ggml_cond_broadcast(c) WakeAllConditionVariable(c)
++#define ggml_cond_wait(c, m) do { LeaveCriticalSection(m); Sleep(1); EnterCriticalSection(m); } while (0)
++#define ggml_cond_broadcast(c) ((void)0)
+ 
+ #define ggml_thread_create pthread_create
+ #define ggml_thread_join   pthread_join
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 882cdf4..342eb55 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -526,26 +526,19 @@ const char * ggml_commit(void) {
+ 
+ #if defined(_MSC_VER) || defined(__MINGW32__)
+ static int64_t timer_freq, timer_start;
+-static BOOL CALLBACK ggml_time_init_once(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+-    UNUSED(once);
+-    UNUSED(param);
+-    UNUSED(ctx);
+-
++static volatile LONG ggml_time_inited = 0;
++void ggml_time_init(void) {
++    // XP compatible one-time init (InitOnceExecuteOnce needs Vista+)
++    if (InterlockedCompareExchange(&ggml_time_inited, 1, 0) != 0) {
++        while (ggml_time_inited != 2) { Sleep(0); }
++        return;
++    }
+     LARGE_INTEGER t;
+     QueryPerformanceFrequency(&t);
+     timer_freq = t.QuadPart;
+-
+-    // The multiplication by 1000 or 1000000 below can cause an overflow if timer_freq
+-    // and the uptime is high enough.
+-    // We subtract the program start time to reduce the likelihood of that happening.
+     QueryPerformanceCounter(&t);
+     timer_start = t.QuadPart;
+-
+-    return TRUE;
+-}
+-void ggml_time_init(void) {
+-    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+-    InitOnceExecuteOnce(&once, ggml_time_init_once, NULL, NULL);
++    InterlockedExchange(&ggml_time_inited, 2);
+ }
+ int64_t ggml_time_ms(void) {
+     LARGE_INTEGER t;
